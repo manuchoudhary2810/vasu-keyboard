@@ -5,9 +5,13 @@ import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.inputmethodservice.InputMethodService
+import android.media.AudioManager
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -32,6 +36,8 @@ class PinkKeyboardService : InputMethodService() {
     private var lang = Lang.EN
     private var shift = Shift.OFF
     private var lastShiftTap = 0L
+    private var pickingLang = false
+    private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
     private var lastComposeTime = 0L
     private val handler = Handler(Looper.getMainLooper())
 
@@ -206,6 +212,7 @@ class PinkKeyboardService : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         composing.setLength(0)
+        pickingLang = false
         if (symbols || emoji) {
             symbols = false
             emoji = false
@@ -262,6 +269,7 @@ class PinkKeyboardService : InputMethodService() {
         letterKeys.clear()
         stripViews.clear()
         shiftKeyView = null
+        pickingLang = false
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -330,25 +338,20 @@ class PinkKeyboardService : InputMethodService() {
             emojiCat = if (recents().isEmpty()) 1 else 0
             setInputView(buildKeyboard())
         }, keyParams(1f))
-        val langLabel = when (lang) {
+        bottom.addView(makeKey(",", imgNormal, 21f) { typeText(",") }, keyParams(1f))
+        val spaceLabel = when (lang) {
             Lang.EN -> "English"
             Lang.HI -> "हिन्दी"
             Lang.HG -> "Hinglish"
         }
-        bottom.addView(makeKey(langLabel, imgWide, 11f) {
-            finishComposing()
-            lang = when (lang) {
-                Lang.EN -> Lang.HI
-                Lang.HI -> Lang.HG
-                Lang.HG -> Lang.EN
-            }
-            shift = Shift.OFF
-            prefs().edit().putString("lang", lang.name).apply()
-            setInputView(buildKeyboard())
-            autoShift()
-        }, keyParams(1.4f))
-        bottom.addView(makeKey(",", imgNormal, 21f) { typeText(",") }, keyParams(1f))
-        bottom.addView(makeKey("", imgSpace, 16f) { typeText(" ") }, keyParams(2.8f))
+        val space = makeKey(spaceLabel, imgSpace, 11f, AudioManager.FX_KEYPRESS_SPACEBAR) { typeText(" ") }
+        space.setOnLongClickListener {
+            feedback()
+            pickingLang = true
+            updateStrip()
+            true
+        }
+        bottom.addView(space, keyParams(4.2f))
         val period = if (lang == Lang.HI && !symbols) "।" else "."
         bottom.addView(makeKey(period, imgNormal, 21f) { typeText(period) }, keyParams(1f))
         bottom.addView(makeKey("↵", imgWide, 16f) { handleEnter() }, keyParams(1.2f))
@@ -391,7 +394,10 @@ class PinkKeyboardService : InputMethodService() {
                     textSize = 24f
                     if (e != null) {
                         text = e
-                        setOnClickListener { typeEmoji(e) }
+                        setOnClickListener {
+                            feedback()
+                            typeEmoji(e)
+                        }
                     }
                 }
                 row.addView(tv, LinearLayout.LayoutParams(0, dp(44), 1f))
@@ -416,7 +422,10 @@ class PinkKeyboardService : InputMethodService() {
         root.addView(bottom)
     }
 
-    private fun makeKey(label: String, bg: Bitmap, size: Float, onClick: () -> Unit): TextView =
+    private fun makeKey(
+        label: String, bg: Bitmap, size: Float,
+        fx: Int = AudioManager.FX_KEYPRESS_STANDARD, onClick: () -> Unit
+    ): TextView =
         TextView(this).apply {
             text = label
             gravity = Gravity.CENTER
@@ -424,7 +433,10 @@ class PinkKeyboardService : InputMethodService() {
             setTextColor(textPink)
             typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
             background = FurDrawable(bg)
-            setOnClickListener { onClick() }
+            setOnClickListener {
+                feedback(fx)
+                onClick()
+            }
         }
 
     private fun makeLetter(k: Key): TextView {
@@ -452,6 +464,7 @@ class PinkKeyboardService : InputMethodService() {
         tv.setOnTouchListener { _, e ->
             when (e.actionMasked) {
                 MotionEvent.ACTION_DOWN -> {
+                    feedback(AudioManager.FX_KEYPRESS_DELETE)
                     deleteOne()
                     handler.postDelayed(repeat, 400)
                 }
@@ -514,12 +527,82 @@ class PinkKeyboardService : InputMethodService() {
         else listOf("🐰", "मैं", "है", "क्या", "🌸")
 
     private fun updateStrip() {
+        if (pickingLang) {
+            val names = listOf("English" to Lang.EN, "हिन्दी" to Lang.HI, "Hinglish" to Lang.HG)
+            stripViews.forEachIndexed { i, t ->
+                t.textSize = 15f
+                val n = names.getOrNull(i)
+                when {
+                    n != null -> {
+                        t.text = if (n.second == lang) "✓ " + n.first else n.first
+                        t.setOnClickListener {
+                            feedback()
+                            selectLang(n.second)
+                        }
+                    }
+                    i == 3 -> {
+                        t.text = "✕"
+                        t.setOnClickListener {
+                            pickingLang = false
+                            updateStrip()
+                        }
+                    }
+                    else -> {
+                        t.text = ""
+                        t.setOnClickListener(null)
+                    }
+                }
+            }
+            return
+        }
         val items = if (composing.isNotEmpty()) candidates(composing.toString()) else defaultStrip()
         stripViews.forEachIndexed { i, t ->
             val s = items.getOrNull(i) ?: ""
             t.text = s
             t.textSize = if (s == "🐰" || s == "🌸") 20f else 16f
-            t.setOnClickListener(if (s.isEmpty()) null else View.OnClickListener { onStripTap(s) })
+            t.setOnClickListener(if (s.isEmpty()) null else View.OnClickListener {
+                feedback()
+                onStripTap(s)
+            })
+        }
+    }
+
+    private fun selectLang(l: Lang) {
+        finishComposing()
+        pickingLang = false
+        lang = l
+        shift = Shift.OFF
+        prefs().edit().putString("lang", lang.name).apply()
+        setInputView(buildKeyboard())
+        autoShift()
+    }
+
+    private fun feedback(fx: Int = AudioManager.FX_KEYPRESS_STANDARD) {
+        try {
+            audio.playSoundEffect(fx)
+        } catch (e: Exception) {
+        }
+        vibrate()
+    }
+
+    @Suppress("DEPRECATION")
+    private fun vibrate() {
+        try {
+            val v = getSystemService(VIBRATOR_SERVICE) as? Vibrator ?: return
+            if (!v.hasVibrator()) return
+            if (Build.VERSION.SDK_INT >= 26) {
+                v.vibrate(VibrationEffect.createOneShot(18, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                v.vibrate(18)
+            }
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun closePicker() {
+        if (pickingLang) {
+            pickingLang = false
+            updateStrip()
         }
     }
 
@@ -550,6 +633,7 @@ class PinkKeyboardService : InputMethodService() {
     }
 
     private fun onLetter(s: String) {
+        closePicker()
         val c = s[0]
         val ascii = s.length == 1 && (c in 'a'..'z' || c in 'A'..'Z')
         if (ascii && hinglishActive()) {
@@ -578,6 +662,7 @@ class PinkKeyboardService : InputMethodService() {
     }
 
     private fun typeText(s: String) {
+        closePicker()
         finishComposing()
         val ic = currentInputConnection ?: return
         ic.commitText(s, 1)
@@ -592,6 +677,7 @@ class PinkKeyboardService : InputMethodService() {
     }
 
     private fun deleteOne() {
+        closePicker()
         if (composing.isNotEmpty()) {
             composing.setLength(composing.length - 1)
             if (composing.isEmpty()) {
@@ -608,6 +694,7 @@ class PinkKeyboardService : InputMethodService() {
     }
 
     private fun handleEnter() {
+        closePicker()
         finishComposing()
         val ic = currentInputConnection ?: return
         val action = currentInputEditorInfo?.imeOptions?.and(EditorInfo.IME_MASK_ACTION)
