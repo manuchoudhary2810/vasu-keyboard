@@ -39,6 +39,11 @@ class PinkKeyboardService : InputMethodService() {
     private var pickingLang = false
     private val audio by lazy { getSystemService(AUDIO_SERVICE) as AudioManager }
     private var lastComposeTime = 0L
+
+    // English word suggestions: letters typed so far in the current word
+    private val wordBuf = StringBuilder()
+    private var lastKeyTime = 0L
+    @Volatile private var words: List<String> = emptyList()
     private val handler = Handler(Looper.getMainLooper())
 
     // Hinglish: roman letters typed so far for the current word
@@ -193,9 +198,96 @@ class PinkKeyboardService : InputMethodService() {
         val list = LinkedHashSet<String>()
         if (!hasUpper) dict[roman.lowercase()]?.let { list.add(it) }
         list.add(translit(clean, false))
+        if (!hasUpper && roman.length >= 2) {
+            val low = roman.lowercase()
+            dict.entries.filter { it.key.startsWith(low) && it.key != low }
+                .take(2).forEach { list.add(it.value) }
+        }
         list.add(translit(clean, true))
-        list.add(roman)
-        return list.toList()
+        val out = LinkedHashSet<String>(list.take(4))
+        out.add(roman)
+        return out.toList()
+    }
+
+    // ---------------------------------------------------------------- English word suggestions
+
+    private fun osa(a: String, b: String): Int {
+        val d = Array(a.length + 1) { IntArray(b.length + 1) }
+        for (i in 0..a.length) d[i][0] = i
+        for (j in 0..b.length) d[0][j] = j
+        for (i in 1..a.length) {
+            for (j in 1..b.length) {
+                val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                var v = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+                if (i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1]) {
+                    v = minOf(v, d[i - 2][j - 2] + 1)
+                }
+                d[i][j] = v
+            }
+        }
+        return d[a.length][b.length]
+    }
+
+    private fun matchCase(typed: String, sug: String): String {
+        var r = sug
+        if (typed.length > 1 && typed.all { it.isUpperCase() }) {
+            r = sug.uppercase()
+        } else if (typed[0].isUpperCase()) {
+            r = sug.replaceFirstChar { it.uppercase() }
+        }
+        if (r == "i") r = "I"
+        if (r.startsWith("i'")) r = "I" + r.substring(1)
+        return r
+    }
+
+    // completions first (common words first), then close spellings for typos
+    private fun suggestWords(typed: String): List<String> {
+        val w = words
+        if (w.isEmpty() || typed.isEmpty()) return emptyList()
+        val t = typed.lowercase()
+        val out = ArrayList<String>()
+        for (x in w) {
+            if (x.length > t.length && x.startsWith(t)) {
+                out.add(x)
+                if (out.size >= 5) break
+            }
+        }
+        if (out.size < 3 && t.length >= 3) {
+            val maxD = if (t.length >= 5) 2 else 1
+            val found = ArrayList<Triple<Int, Int, String>>()
+            val limit = minOf(w.size, 40000)
+            for (idx in 0 until limit) {
+                val x = w[idx]
+                if (x == t || x[0] != t[0]) continue
+                if (Math.abs(x.length - t.length) > 2) continue
+                val d = osa(t, x.substring(0, minOf(x.length, t.length + 1)))
+                val d2 = osa(t, x)
+                val best = minOf(d, d2)
+                if (best <= maxD && x !in out) found.add(Triple(best, idx, x))
+            }
+            found.sortWith(compareBy<Triple<Int, Int, String>>({ it.first }, { it.second }))
+            for (f in found) {
+                if (out.size >= 5) break
+                if (f.third !in out) out.add(f.third)
+            }
+        }
+        return out.map { matchCase(typed, it) }
+    }
+
+    private fun trackWord(s: String) {
+        lastKeyTime = SystemClock.uptimeMillis()
+        if (lang != Lang.EN) {
+            wordBuf.setLength(0)
+            return
+        }
+        val c = s[0]
+        if (s.length == 1 && (c in 'a'..'z' || c in 'A'..'Z')) {
+            wordBuf.append(s)
+        } else if (s == "'" && wordBuf.isNotEmpty()) {
+            wordBuf.append(s)
+        } else {
+            wordBuf.setLength(0)
+        }
     }
 
     // ---------------------------------------------------------------- lifecycle
@@ -205,6 +297,12 @@ class PinkKeyboardService : InputMethodService() {
     override fun onCreate() {
         super.onCreate()
         lang = runCatching { Lang.valueOf(prefs().getString("lang", "EN") ?: "EN") }.getOrDefault(Lang.EN)
+        Thread {
+            try {
+                words = assets.open("words.txt").bufferedReader().readLines()
+            } catch (e: Exception) {
+            }
+        }.start()
     }
 
     override fun onCreateInputView(): View = buildKeyboard()
@@ -212,6 +310,7 @@ class PinkKeyboardService : InputMethodService() {
     override fun onStartInputView(info: EditorInfo?, restarting: Boolean) {
         super.onStartInputView(info, restarting)
         composing.setLength(0)
+        wordBuf.setLength(0)
         pickingLang = false
         if (symbols || emoji) {
             symbols = false
@@ -240,6 +339,10 @@ class PinkKeyboardService : InputMethodService() {
         ) {
             composing.setLength(0)
             currentInputConnection?.finishComposingText()
+            updateStrip()
+        }
+        if (wordBuf.isNotEmpty() && SystemClock.uptimeMillis() - lastKeyTime > 250) {
+            wordBuf.setLength(0)
             updateStrip()
         }
     }
@@ -555,7 +658,13 @@ class PinkKeyboardService : InputMethodService() {
             }
             return
         }
-        val items = if (composing.isNotEmpty()) candidates(composing.toString()) else defaultStrip()
+        val items = when {
+            composing.isNotEmpty() -> candidates(composing.toString())
+            lang == Lang.EN && wordBuf.isNotEmpty() -> {
+                suggestWords(wordBuf.toString())
+            }
+            else -> defaultStrip()
+        }
         stripViews.forEachIndexed { i, t ->
             val s = items.getOrNull(i) ?: ""
             t.text = s
@@ -569,6 +678,7 @@ class PinkKeyboardService : InputMethodService() {
 
     private fun selectLang(l: Lang) {
         finishComposing()
+        wordBuf.setLength(0)
         pickingLang = false
         lang = l
         shift = Shift.OFF
@@ -611,6 +721,16 @@ class PinkKeyboardService : InputMethodService() {
             val ic = currentInputConnection ?: return
             ic.commitText("$s ", 1)
             composing.setLength(0)
+            afterKey()
+            updateStrip()
+        } else if (lang == Lang.EN && wordBuf.isNotEmpty() && s != "🐰" && s != "🌸" &&
+            suggestWords(wordBuf.toString()).contains(s)
+        ) {
+            val ic = currentInputConnection ?: return
+            ic.deleteSurroundingText(wordBuf.length, 0)
+            ic.commitText("$s ", 1)
+            wordBuf.setLength(0)
+            lastKeyTime = SystemClock.uptimeMillis()
             afterKey()
             updateStrip()
         } else {
@@ -666,6 +786,7 @@ class PinkKeyboardService : InputMethodService() {
         finishComposing()
         val ic = currentInputConnection ?: return
         ic.commitText(s, 1)
+        trackWord(s)
         afterKey()
     }
 
@@ -673,6 +794,7 @@ class PinkKeyboardService : InputMethodService() {
         finishComposing()
         val ic = currentInputConnection ?: return
         ic.commitText(e, 1)
+        wordBuf.setLength(0)
         addRecent(e)
     }
 
@@ -691,11 +813,17 @@ class PinkKeyboardService : InputMethodService() {
         val ic = currentInputConnection ?: return
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DEL))
         ic.sendKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DEL))
+        if (wordBuf.isNotEmpty()) {
+            wordBuf.setLength(wordBuf.length - 1)
+            lastKeyTime = SystemClock.uptimeMillis()
+            updateStrip()
+        }
     }
 
     private fun handleEnter() {
         closePicker()
         finishComposing()
+        wordBuf.setLength(0)
         val ic = currentInputConnection ?: return
         val action = currentInputEditorInfo?.imeOptions?.and(EditorInfo.IME_MASK_ACTION)
         if (action != null && action != EditorInfo.IME_ACTION_NONE && action != EditorInfo.IME_ACTION_UNSPECIFIED) {
